@@ -1,3 +1,346 @@
+from fastapi import FastAPI, HTTPException
+import requests
+
+app = FastAPI(
+    title="NFL Research Server",
+    description="NFL schedules, game stats, team stats, player stats and weekly research",
+    version="1.0"
+)
+
+ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+ESPN_WEB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
+
+
+def fetch_json(url, params=None):
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers=HEADERS,
+            timeout=20
+        )
+
+        response.raise_for_status()
+        return response.json()
+
+    except requests.RequestException as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Unable to retrieve NFL data: {str(e)}"
+        )
+
+
+# ---------------------------------------------------------
+# HOME / SERVER STATUS
+# ---------------------------------------------------------
+
+@app.get("/")
+def home():
+    return {
+        "status": "NFL Research Server is running",
+        "available_endpoints": {
+            "schedule": "/schedule/{season}/{week}",
+            "research": "/research/{season}/{week}",
+            "game_stats": "/game/{game_id}",
+            "team_stats": "/team/{team}/stats",
+            "team_roster": "/team/{team}/roster",
+            "player": "/player/{player_id}",
+            "player_stats": "/player/{player_id}/stats",
+            "player_gamelog": "/player/{player_id}/gamelog"
+        }
+    }
+
+
+# ---------------------------------------------------------
+# NFL WEEKLY SCHEDULE
+# ---------------------------------------------------------
+
+@app.get("/schedule/{season}/{week}")
+def schedule(season: int, week: int):
+    url = f"{ESPN_SITE}/scoreboard"
+
+    params = {
+        "dates": season,
+        "seasontype": 2,
+        "week": week
+    }
+
+    data = fetch_json(url, params)
+
+    games = []
+
+    for event in data.get("events", []):
+        competitions = event.get("competitions", [])
+
+        if not competitions:
+            continue
+
+        competition = competitions[0]
+        teams = competition.get("competitors", [])
+
+        try:
+            home = next(
+                x for x in teams
+                if x.get("homeAway") == "home"
+            )
+
+            away = next(
+                x for x in teams
+                if x.get("homeAway") == "away"
+            )
+
+        except StopIteration:
+            continue
+
+        games.append({
+            "game_id": event.get("id"),
+            "game": event.get("name"),
+            "date": event.get("date"),
+            "home": home.get("team", {}).get("displayName"),
+            "home_abbreviation": home.get("team", {}).get("abbreviation"),
+            "away": away.get("team", {}).get("displayName"),
+            "away_abbreviation": away.get("team", {}).get("abbreviation"),
+            "status": event.get("status", {})
+                .get("type", {})
+                .get("description")
+        })
+
+    return {
+        "season": season,
+        "week": week,
+        "games": games
+    }
+
+
+# ---------------------------------------------------------
+# GAME STATS / BOX SCORE
+# ---------------------------------------------------------
+
+@app.get("/game/{game_id}")
+def game_stats(game_id: str):
+    url = f"{ESPN_SITE}/summary"
+
+    data = fetch_json(
+        url,
+        {"event": game_id}
+    )
+
+    boxscore = data.get("boxscore", {})
+
+    team_stats = []
+
+    for entry in boxscore.get("teams", []):
+        team = entry.get("team", {})
+
+        stats = {}
+
+        for stat in entry.get("statistics", []):
+            name = stat.get("name")
+
+            if name:
+                stats[name] = stat.get(
+                    "displayValue",
+                    stat.get("value")
+                )
+
+        team_stats.append({
+            "team_id": team.get("id"),
+            "team": team.get("displayName"),
+            "abbreviation": team.get("abbreviation"),
+            "stats": stats
+        })
+
+    player_stats = []
+
+    for team_entry in boxscore.get("players", []):
+        team = team_entry.get("team", {})
+        categories = []
+
+        for category in team_entry.get("statistics", []):
+            labels = category.get("labels", [])
+            players = []
+
+            for athlete_entry in category.get("athletes", []):
+                athlete = athlete_entry.get("athlete", {})
+                raw_stats = athlete_entry.get("stats", [])
+
+                stat_dict = {}
+
+                for index, label in enumerate(labels):
+                    if index < len(raw_stats):
+                        stat_dict[label] = raw_stats[index]
+
+                players.append({
+                    "player_id": athlete.get("id"),
+                    "name": athlete.get("displayName"),
+                    "position": athlete.get(
+                        "position",
+                        {}
+                    ).get("abbreviation"),
+                    "stats": stat_dict
+                })
+
+            categories.append({
+                "category": category.get("name"),
+                "players": players
+            })
+
+        player_stats.append({
+            "team": team.get("displayName"),
+            "abbreviation": team.get("abbreviation"),
+            "categories": categories
+        })
+
+    return {
+        "game_id": game_id,
+        "header": data.get("header"),
+        "team_stats": team_stats,
+        "player_stats": player_stats,
+        "leaders": data.get("leaders"),
+        "scoring_plays": data.get("scoringPlays"),
+        "drives": data.get("drives"),
+        "win_probability": data.get("winprobability"),
+        "injuries": data.get("injuries"),
+        "pickcenter": data.get("pickcenter")
+    }
+
+
+# ---------------------------------------------------------
+# TEAM SEASON STATS
+# Example:
+# /team/kc/stats
+# ---------------------------------------------------------
+
+@app.get("/team/{team}/stats")
+def team_stats(team: str):
+    url = f"{ESPN_SITE}/teams/{team}/statistics"
+
+    data = fetch_json(url)
+
+    return {
+        "team": team.upper(),
+        "data": data
+    }
+
+
+# ---------------------------------------------------------
+# TEAM ROSTER
+# Example:
+# /team/kc/roster
+# ---------------------------------------------------------
+
+@app.get("/team/{team}/roster")
+def team_roster(team: str):
+    url = f"{ESPN_SITE}/teams/{team}/roster"
+
+    data = fetch_json(url)
+
+    players = []
+
+    for group in data.get("athletes", []):
+        position_group = group.get("position")
+
+        for athlete in group.get("items", []):
+            players.append({
+                "player_id": athlete.get("id"),
+                "name": athlete.get("fullName"),
+                "display_name": athlete.get("displayName"),
+                "position": athlete.get(
+                    "position",
+                    {}
+                ).get("abbreviation"),
+                "jersey": athlete.get("jersey"),
+                "age": athlete.get("age"),
+                "height": athlete.get("displayHeight"),
+                "weight": athlete.get("displayWeight"),
+                "status": athlete.get("status"),
+                "position_group": position_group
+            })
+
+    return {
+        "team": team.upper(),
+        "players": players
+    }
+
+
+# ---------------------------------------------------------
+# PLAYER INFORMATION
+# Example:
+# /player/4430807
+# ---------------------------------------------------------
+
+@app.get("/player/{player_id}")
+def player(player_id: str):
+    url = f"{ESPN_WEB}/athletes/{player_id}"
+
+    return fetch_json(url)
+
+
+# ---------------------------------------------------------
+# PLAYER STATS
+# Example:
+# /player/4430807/stats?season=2026
+# ---------------------------------------------------------
+
+@app.get("/player/{player_id}/stats")
+def player_stats(
+    player_id: str,
+    season: int = None
+):
+    url = f"{ESPN_WEB}/athletes/{player_id}/stats"
+
+    params = {}
+
+    if season:
+        params["season"] = season
+        params["seasontype"] = 2
+
+    data = fetch_json(
+        url,
+        params if params else None
+    )
+
+    return {
+        "player_id": player_id,
+        "season": season,
+        "data": data
+    }
+
+
+# ---------------------------------------------------------
+# PLAYER GAME LOG
+# Example:
+# /player/4430807/gamelog?season=2026
+# ---------------------------------------------------------
+
+@app.get("/player/{player_id}/gamelog")
+def player_gamelog(
+    player_id: str,
+    season: int = None
+):
+    url = f"{ESPN_WEB}/athletes/{player_id}/gamelog"
+
+    params = {}
+
+    if season:
+        params["season"] = season
+
+    data = fetch_json(
+        url,
+        params if params else None
+    )
+
+    return {
+        "player_id": player_id,
+        "season": season,
+        "data": data
+    }
+
+
 # ---------------------------------------------------------
 # WEEKLY RESEARCH PACKAGE
 # Example:
@@ -6,8 +349,6 @@
 
 @app.get("/research/{season}/{week}")
 def weekly_research(season: int, week: int):
-
-    # 1. Get weekly schedule
     schedule_url = f"{ESPN_SITE}/scoreboard"
 
     schedule_data = fetch_json(
@@ -21,9 +362,7 @@ def weekly_research(season: int, week: int):
 
     research_games = []
 
-    # 2. Loop through every game
     for event in schedule_data.get("events", []):
-
         game_id = event.get("id")
 
         competitions = event.get("competitions", [])
@@ -32,7 +371,6 @@ def weekly_research(season: int, week: int):
             continue
 
         competition = competitions[0]
-
         competitors = competition.get("competitors", [])
 
         try:
@@ -55,94 +393,62 @@ def weekly_research(season: int, week: int):
         home_abbr = home_team.get("abbreviation")
         away_abbr = away_team.get("abbreviation")
 
-        # ---------------------------------------------
-        # 3. Get detailed game information
-        # ---------------------------------------------
-
+        # Game summary
         game_summary = {}
 
         if game_id:
-
             try:
                 game_summary = fetch_json(
                     f"{ESPN_SITE}/summary",
                     {"event": game_id}
                 )
-
             except Exception:
                 game_summary = {}
 
-        # ---------------------------------------------
-        # 4. Team box score statistics
-        # ---------------------------------------------
-
-        team_stats = []
-
+        # Team box score stats
         boxscore = game_summary.get("boxscore", {})
 
+        game_team_stats = []
+
         for entry in boxscore.get("teams", []):
-
             team = entry.get("team", {})
-
             stats = {}
 
             for stat in entry.get("statistics", []):
+                name = stat.get("name")
 
-                stat_name = stat.get("name")
+                if name:
+                    stats[name] = stat.get(
+                        "displayValue",
+                        stat.get("value")
+                    )
 
-                stat_value = stat.get(
-                    "displayValue",
-                    stat.get("value")
-                )
-
-                if stat_name:
-                    stats[stat_name] = stat_value
-
-            team_stats.append({
+            game_team_stats.append({
                 "team": team.get("displayName"),
                 "abbreviation": team.get("abbreviation"),
                 "stats": stats
             })
 
-        # ---------------------------------------------
-        # 5. Player statistics
-        # ---------------------------------------------
-
-        player_stats = []
+        # Player box score stats
+        game_player_stats = []
 
         for team_entry in boxscore.get("players", []):
-
             team = team_entry.get("team", {})
-
             categories = []
 
             for category in team_entry.get("statistics", []):
-
                 labels = category.get("labels", [])
-
                 category_players = []
 
-                for athlete_entry in category.get(
-                    "athletes",
-                    []
-                ):
+                for athlete_entry in category.get("athletes", []):
+                    athlete = athlete_entry.get("athlete", {})
+                    raw_stats = athlete_entry.get("stats", [])
 
-                    athlete = athlete_entry.get(
-                        "athlete",
-                        {}
-                    )
-
-                    raw_stats = athlete_entry.get(
-                        "stats",
-                        []
-                    )
-
-                    stats = {}
+                    stat_dict = {}
 
                     for index, label in enumerate(labels):
-
                         if index < len(raw_stats):
-                            stats[label] = raw_stats[index]
+                            stat_dict[label] = raw_stats[index]
 
                     category_players.append({
                         "player_id": athlete.get("id"),
@@ -151,7 +457,7 @@ def weekly_research(season: int, week: int):
                             "position",
                             {}
                         ).get("abbreviation"),
-                        "stats": stats
+                        "stats": stat_dict
                     })
 
                 categories.append({
@@ -159,56 +465,38 @@ def weekly_research(season: int, week: int):
                     "players": category_players
                 })
 
-            player_stats.append({
+            game_player_stats.append({
                 "team": team.get("displayName"),
                 "abbreviation": team.get("abbreviation"),
                 "categories": categories
             })
 
-        # ---------------------------------------------
-        # 6. Home team season stats
-        # ---------------------------------------------
-
+        # Home team season stats
         home_season_stats = {}
 
         if home_abbr:
-
             try:
                 home_season_stats = fetch_json(
                     f"{ESPN_SITE}/teams/{home_abbr}/statistics"
                 )
-
             except Exception:
                 home_season_stats = {}
 
-        # ---------------------------------------------
-        # 7. Away team season stats
-        # ---------------------------------------------
-
+        # Away team season stats
         away_season_stats = {}
 
         if away_abbr:
-
             try:
                 away_season_stats = fetch_json(
                     f"{ESPN_SITE}/teams/{away_abbr}/statistics"
                 )
-
             except Exception:
                 away_season_stats = {}
 
-        # ---------------------------------------------
-        # 8. Add everything to research package
-        # ---------------------------------------------
-
         research_games.append({
-
             "game_id": game_id,
-
             "game": event.get("name"),
-
             "date": event.get("date"),
-
             "status": event.get(
                 "status",
                 {}
@@ -233,24 +521,14 @@ def weekly_research(season: int, week: int):
                 "season_stats": away_season_stats
             },
 
-            "game_team_stats": team_stats,
-
-            "game_player_stats": player_stats,
+            "game_team_stats": game_team_stats,
+            "game_player_stats": game_player_stats,
 
             "leaders": game_summary.get("leaders"),
-
             "injuries": game_summary.get("injuries"),
-
             "drives": game_summary.get("drives"),
-
-            "scoring_plays": game_summary.get(
-                "scoringPlays"
-            ),
-
-            "win_probability": game_summary.get(
-                "winprobability"
-            ),
-
+            "scoring_plays": game_summary.get("scoringPlays"),
+            "win_probability": game_summary.get("winprobability"),
             "pickcenter": game_summary.get("pickcenter")
         })
 
@@ -259,5 +537,4 @@ def weekly_research(season: int, week: int):
         "week": week,
         "game_count": len(research_games),
         "games": research_games
-    }@app.get("/research/{season}/{week}")
-    def weekly_research(season: int, week: int):
+    }
