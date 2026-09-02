@@ -3,8 +3,8 @@ import requests
 
 app = FastAPI(
     title="NFL Research Server",
-    description="NFL schedules, game stats, team stats, player stats and weekly research",
-    version="1.1"
+    description="NFL schedules, game data, team data, player data and weekly research",
+    version="1.2"
 )
 
 # ---------------------------------------------------------
@@ -12,7 +12,17 @@ app = FastAPI(
 # ---------------------------------------------------------
 
 ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
-ESPN_WEB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl"
+
+ESPN_WEB = (
+    "https://site.web.api.espn.com/apis/common/v3/"
+    "sports/football/nfl"
+)
+
+ESPN_CORE = (
+    "https://sports.core.api.espn.com/v2/"
+    "sports/football/leagues/nfl"
+)
+
 ESPN_CDN = "https://cdn.espn.com/core/nfl"
 
 HEADERS = {
@@ -21,19 +31,27 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/128.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.espn.com/",
+    "Accept": "application/json,text/plain,*/*",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
 
 # ---------------------------------------------------------
-# GENERIC REQUEST FUNCTION
+# GENERIC JSON FETCHER
 # ---------------------------------------------------------
 
-def fetch_json(url, params=None, allow_failure=False):
-
+def fetch_json(
+    url,
+    params=None,
+    allow_failure=False
+):
     try:
+
+        # Some ESPN Core refs contain http://
+        # Force HTTPS when possible.
+        if url.startswith("http://"):
+            url = "https://" + url[7:]
+
         response = requests.get(
             url,
             params=params,
@@ -42,6 +60,21 @@ def fetch_json(url, params=None, allow_failure=False):
         )
 
         response.raise_for_status()
+
+        content_type = response.headers.get(
+            "content-type",
+            ""
+        ).lower()
+
+        if (
+            "json" not in content_type
+            and not response.text.strip().startswith(
+                ("{", "[")
+            )
+        ):
+            raise ValueError(
+                "ESPN returned non-JSON content"
+            )
 
         return response.json()
 
@@ -52,252 +85,322 @@ def fetch_json(url, params=None, allow_failure=False):
 
         raise HTTPException(
             status_code=502,
-            detail=f"Unable to retrieve NFL data: {str(e)}"
-        )
-
-
-# ---------------------------------------------------------
-# SCHEDULE FETCHER WITH FALLBACK
-# ---------------------------------------------------------
-
-def get_week_schedule(season: int, week: int):
-
-    # First attempt: site.api.espn.com
-    primary_url = f"{ESPN_SITE}/scoreboard"
-
-    try:
-
-        response = requests.get(
-            primary_url,
-            params={
-                "dates": season,
-                "seasontype": 2,
-                "week": week
-            },
-            headers=HEADERS,
-            timeout=20
-        )
-
-        if response.status_code == 200:
-
-            data = response.json()
-
-            if data.get("events"):
-                return {
-                    "source": "site.api.espn.com",
-                    "data": data
-                }
-
-    except Exception:
-        pass
-
-
-    # -----------------------------------------------------
-    # FALLBACK: ESPN CDN
-    # -----------------------------------------------------
-
-    fallback_url = f"{ESPN_CDN}/schedule"
-
-    try:
-
-        response = requests.get(
-            fallback_url,
-            params={
-                "xhr": 1,
-                "year": season,
-                "week": week
-            },
-            headers=HEADERS,
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        return {
-            "source": "cdn.espn.com",
-            "data": data
-        }
-
-    except Exception as e:
-
-        raise HTTPException(
-            status_code=502,
             detail=(
-                "Both ESPN schedule sources failed. "
-                f"Final error: {str(e)}"
+                "Unable to retrieve NFL data. "
+                f"Error: {str(e)}"
             )
         )
 
 
 # ---------------------------------------------------------
-# NORMALIZE SCHEDULE DATA
+# EXTRACT ID FROM ESPN REF
 # ---------------------------------------------------------
 
-def normalize_schedule(schedule_package):
+def id_from_ref(ref):
 
-    source = schedule_package["source"]
-    data = schedule_package["data"]
+    if not ref:
+        return None
+
+    base = ref.split("?")[0]
+
+    return base.rstrip("/").split("/")[-1]
+
+
+# ---------------------------------------------------------
+# FETCH TEAM DETAILS FROM CORE API
+# ---------------------------------------------------------
+
+def get_team_from_ref(team_ref):
+
+    if not team_ref:
+
+        return {
+            "id": None,
+            "name": None,
+            "displayName": None,
+            "abbreviation": None
+        }
+
+    data = fetch_json(
+        team_ref,
+        allow_failure=True
+    )
+
+    return {
+        "id": data.get("id"),
+        "name": data.get("name"),
+        "displayName": (
+            data.get("displayName")
+            or data.get("name")
+        ),
+        "abbreviation": data.get("abbreviation")
+    }
+
+
+# ---------------------------------------------------------
+# GET SCORE FROM CORE API
+# ---------------------------------------------------------
+
+def get_score(score_object):
+
+    if not score_object:
+        return None
+
+    # Sometimes score is embedded directly
+    if "value" in score_object:
+        return score_object.get("value")
+
+    if "displayValue" in score_object:
+        return score_object.get(
+            "displayValue"
+        )
+
+    score_ref = score_object.get("$ref")
+
+    if score_ref:
+
+        score_data = fetch_json(
+            score_ref,
+            allow_failure=True
+        )
+
+        return (
+            score_data.get("displayValue")
+            or score_data.get("value")
+        )
+
+    return None
+
+
+# ---------------------------------------------------------
+# GET NFL WEEK FROM ESPN CORE API
+# ---------------------------------------------------------
+
+def get_week_schedule(
+    season: int,
+    week: int
+):
+
+    url = (
+        f"{ESPN_CORE}/seasons/"
+        f"{season}/types/2/weeks/"
+        f"{week}/events"
+    )
+
+    data = fetch_json(
+        url,
+        {
+            "limit": 50,
+            "lang": "en",
+            "region": "us"
+        }
+    )
+
+    items = data.get("items", [])
 
     games = []
 
+    for item in items:
 
-    # -----------------------------------------------------
-    # SITE API FORMAT
-    # -----------------------------------------------------
+        event_ref = item.get("$ref")
 
-    if source == "site.api.espn.com":
+        if not event_ref:
+            continue
 
-        for event in data.get("events", []):
+        event = fetch_json(
+            event_ref,
+            allow_failure=True
+        )
 
-            competitions = event.get("competitions", [])
+        if not event:
+            continue
 
-            if not competitions:
-                continue
+        event_id = event.get(
+            "id",
+            id_from_ref(event_ref)
+        )
 
-            competition = competitions[0]
+        competitions = event.get(
+            "competitions",
+            []
+        )
 
-            competitors = competition.get("competitors", [])
+        if not competitions:
+            continue
 
-            try:
+        competition = competitions[0]
 
-                home = next(
-                    x for x in competitors
-                    if x.get("homeAway") == "home"
-                )
+        competitors = competition.get(
+            "competitors",
+            []
+        )
 
-                away = next(
-                    x for x in competitors
-                    if x.get("homeAway") == "away"
-                )
+        home_competitor = None
+        away_competitor = None
 
-            except StopIteration:
-                continue
+        for competitor in competitors:
 
-            games.append({
+            if competitor.get(
+                "homeAway"
+            ) == "home":
 
-                "game_id": event.get("id"),
+                home_competitor = competitor
 
-                "game": event.get("name"),
+            elif competitor.get(
+                "homeAway"
+            ) == "away":
 
-                "date": event.get("date"),
-
-                "home": {
-                    "name": home.get("team", {}).get("displayName"),
-                    "abbreviation": home.get("team", {}).get("abbreviation"),
-                    "team_id": home.get("team", {}).get("id"),
-                    "score": home.get("score"),
-                    "records": home.get("records")
-                },
-
-                "away": {
-                    "name": away.get("team", {}).get("displayName"),
-                    "abbreviation": away.get("team", {}).get("abbreviation"),
-                    "team_id": away.get("team", {}).get("id"),
-                    "score": away.get("score"),
-                    "records": away.get("records")
-                },
-
-                "status": event.get(
-                    "status",
-                    {}
-                ).get(
-                    "type",
-                    {}
-                ).get("description")
-            })
+                away_competitor = competitor
 
 
-    # -----------------------------------------------------
-    # CDN FORMAT
-    # -----------------------------------------------------
+        if not home_competitor:
+            continue
 
-    else:
-
-        content = data.get("content", {})
-
-        schedule = content.get("schedule", {})
-
-        entries = schedule.get("events", [])
-
-        if not entries:
-
-            entries = content.get("events", [])
-
-        if not entries:
-
-            entries = data.get("events", [])
+        if not away_competitor:
+            continue
 
 
-        for event in entries:
+        home_team_ref = (
+            home_competitor.get(
+                "team",
+                {}
+            ).get("$ref")
+        )
 
-            competitions = event.get("competitions", [])
+        away_team_ref = (
+            away_competitor.get(
+                "team",
+                {}
+            ).get("$ref")
+        )
 
-            if not competitions:
-                continue
 
-            competition = competitions[0]
+        home_team = get_team_from_ref(
+            home_team_ref
+        )
 
-            competitors = competition.get("competitors", [])
+        away_team = get_team_from_ref(
+            away_team_ref
+        )
 
-            try:
 
-                home = next(
-                    x for x in competitors
-                    if x.get("homeAway") == "home"
-                )
+        home_score = get_score(
+            home_competitor.get(
+                "score",
+                {}
+            )
+        )
 
-                away = next(
-                    x for x in competitors
-                    if x.get("homeAway") == "away"
-                )
+        away_score = get_score(
+            away_competitor.get(
+                "score",
+                {}
+            )
+        )
 
-            except StopIteration:
-                continue
 
-            games.append({
+        status = competition.get(
+            "status",
+            {}
+        )
 
-                "game_id": event.get("id"),
+        if "$ref" in status:
 
-                "game": event.get(
-                    "name",
-                    event.get("shortName")
+            status_data = fetch_json(
+                status["$ref"],
+                allow_failure=True
+            )
+
+            status_name = (
+                status_data
+                .get("type", {})
+                .get("description")
+            )
+
+        else:
+
+            status_name = (
+                status
+                .get("type", {})
+                .get("description")
+            )
+
+
+        games.append({
+
+            "game_id":
+                event_id,
+
+            "game":
+                event.get(
+                    "name"
                 ),
 
-                "date": event.get("date"),
+            "short_name":
+                event.get(
+                    "shortName"
+                ),
 
-                "home": {
-                    "name": home.get("team", {}).get("displayName"),
-                    "abbreviation": home.get("team", {}).get("abbreviation"),
-                    "team_id": home.get("team", {}).get("id"),
-                    "score": home.get("score"),
-                    "records": home.get("records")
-                },
+            "date":
+                event.get(
+                    "date"
+                ),
 
-                "away": {
-                    "name": away.get("team", {}).get("displayName"),
-                    "abbreviation": away.get("team", {}).get("abbreviation"),
-                    "team_id": away.get("team", {}).get("id"),
-                    "score": away.get("score"),
-                    "records": away.get("records")
-                },
+            "status":
+                status_name,
 
-                "status": event.get(
-                    "status",
-                    {}
-                ).get(
-                    "type",
-                    {}
-                ).get("description")
-            })
+            "home": {
+
+                "team_id":
+                    home_team.get("id"),
+
+                "name":
+                    home_team.get(
+                        "displayName"
+                    ),
+
+                "abbreviation":
+                    home_team.get(
+                        "abbreviation"
+                    ),
+
+                "score":
+                    home_score
+            },
+
+            "away": {
+
+                "team_id":
+                    away_team.get("id"),
+
+                "name":
+                    away_team.get(
+                        "displayName"
+                    ),
+
+                "abbreviation":
+                    away_team.get(
+                        "abbreviation"
+                    ),
+
+                "score":
+                    away_score
+            }
+        })
 
 
-    return games
+    return {
+
+        "source":
+            "sports.core.api.espn.com",
+
+        "games":
+            games
+    }
 
 
 # ---------------------------------------------------------
-# HOME
+# SERVER STATUS
 # ---------------------------------------------------------
 
 @app.get("/")
@@ -305,9 +408,14 @@ def home():
 
     return {
 
-        "status": "NFL Research Server is running",
+        "status":
+            "NFL Research Server is running",
 
-        "version": "1.1",
+        "version":
+            "1.2",
+
+        "schedule_source":
+            "ESPN Core API",
 
         "available_endpoints": {
 
@@ -343,28 +451,32 @@ def home():
 # ---------------------------------------------------------
 
 @app.get("/schedule/{season}/{week}")
-def schedule(season: int, week: int):
+def schedule(
+    season: int,
+    week: int
+):
 
-    schedule_package = get_week_schedule(
+    result = get_week_schedule(
         season,
         week
     )
 
-    games = normalize_schedule(
-        schedule_package
-    )
-
     return {
 
-        "season": season,
+        "season":
+            season,
 
-        "week": week,
+        "week":
+            week,
 
-        "source": schedule_package["source"],
+        "source":
+            result["source"],
 
-        "game_count": len(games),
+        "game_count":
+            len(result["games"]),
 
-        "games": games
+        "games":
+            result["games"]
     }
 
 
@@ -373,234 +485,81 @@ def schedule(season: int, week: int):
 # ---------------------------------------------------------
 
 @app.get("/game/{game_id}")
-def game_stats(game_id: str):
+def game_stats(
+    game_id: str
+):
 
-    # -----------------------------------------------------
-    # First attempt ESPN site summary
-    # -----------------------------------------------------
+    # -----------------------------------------
+    # First try ESPN Core event endpoint
+    # -----------------------------------------
 
-    site_data = fetch_json(
-        f"{ESPN_SITE}/summary",
-        {
-            "event": game_id
-        },
+    core_event = fetch_json(
+
+        f"{ESPN_CORE}/events/{game_id}",
+
         allow_failure=True
     )
 
 
-    if site_data:
+    # -----------------------------------------
+    # Try site summary for richer stats
+    # -----------------------------------------
 
-        boxscore = site_data.get(
-            "boxscore",
-            {}
-        )
+    site_summary = fetch_json(
 
-        team_stats = []
+        f"{ESPN_SITE}/summary",
 
-        for entry in boxscore.get(
-            "teams",
-            []
-        ):
-
-            team = entry.get(
-                "team",
-                {}
-            )
-
-            stats = {}
-
-            for stat in entry.get(
-                "statistics",
-                []
-            ):
-
-                name = stat.get("name")
-
-                if name:
-
-                    stats[name] = stat.get(
-                        "displayValue",
-                        stat.get("value")
-                    )
-
-            team_stats.append({
-
-                "team_id":
-                    team.get("id"),
-
-                "team":
-                    team.get("displayName"),
-
-                "abbreviation":
-                    team.get("abbreviation"),
-
-                "stats":
-                    stats
-            })
-
-
-        player_stats = []
-
-        for team_entry in boxscore.get(
-            "players",
-            []
-        ):
-
-            team = team_entry.get(
-                "team",
-                {}
-            )
-
-            categories = []
-
-            for category in team_entry.get(
-                "statistics",
-                []
-            ):
-
-                labels = category.get(
-                    "labels",
-                    []
-                )
-
-                players = []
-
-                for athlete_entry in category.get(
-                    "athletes",
-                    []
-                ):
-
-                    athlete = athlete_entry.get(
-                        "athlete",
-                        {}
-                    )
-
-                    raw_stats = athlete_entry.get(
-                        "stats",
-                        []
-                    )
-
-                    stat_dict = {}
-
-                    for index, label in enumerate(
-                        labels
-                    ):
-
-                        if index < len(raw_stats):
-
-                            stat_dict[label] = (
-                                raw_stats[index]
-                            )
-
-                    players.append({
-
-                        "player_id":
-                            athlete.get("id"),
-
-                        "name":
-                            athlete.get(
-                                "displayName"
-                            ),
-
-                        "position":
-                            athlete.get(
-                                "position",
-                                {}
-                            ).get(
-                                "abbreviation"
-                            ),
-
-                        "stats":
-                            stat_dict
-                    })
-
-
-                categories.append({
-
-                    "category":
-                        category.get("name"),
-
-                    "players":
-                        players
-                })
-
-
-            player_stats.append({
-
-                "team":
-                    team.get("displayName"),
-
-                "abbreviation":
-                    team.get("abbreviation"),
-
-                "categories":
-                    categories
-            })
-
-
-        return {
-
-            "game_id":
-                game_id,
-
-            "source":
-                "site.api.espn.com",
-
-            "header":
-                site_data.get("header"),
-
-            "team_stats":
-                team_stats,
-
-            "player_stats":
-                player_stats,
-
-            "leaders":
-                site_data.get("leaders"),
-
-            "injuries":
-                site_data.get("injuries"),
-
-            "scoring_plays":
-                site_data.get(
-                    "scoringPlays"
-                ),
-
-            "drives":
-                site_data.get("drives"),
-
-            "win_probability":
-                site_data.get(
-                    "winprobability"
-                ),
-
-            "pickcenter":
-                site_data.get(
-                    "pickcenter"
-                )
-        }
-
-
-    # -----------------------------------------------------
-    # FALLBACK: ESPN CDN BOX SCORE
-    # -----------------------------------------------------
-
-    cdn_data = fetch_json(
-        f"{ESPN_CDN}/boxscore",
         {
-            "xhr": 1,
-            "gameId": game_id
-        }
+            "event":
+                game_id
+        },
+
+        allow_failure=True
+    )
+
+
+    # -----------------------------------------
+    # Try CDN full game package
+    # -----------------------------------------
+
+    cdn_game = fetch_json(
+
+        f"{ESPN_CDN}/game",
+
+        {
+            "xhr":
+                1,
+
+            "gameId":
+                game_id
+        },
+
+        allow_failure=True
     )
 
 
     return {
 
-        "game_id": game_id,
+        "game_id":
+            game_id,
 
-        "source": "cdn.espn.com",
+        "core_event_available":
+            bool(core_event),
 
-        "data": cdn_data
+        "site_summary_available":
+            bool(site_summary),
+
+        "cdn_game_available":
+            bool(cdn_game),
+
+        "core_event":
+            core_event,
+
+        "site_summary":
+            site_summary,
+
+        "cdn_game":
+            cdn_game
     }
 
 
@@ -609,126 +568,17 @@ def game_stats(game_id: str):
 # ---------------------------------------------------------
 
 @app.get("/team/{team}/stats")
-def team_stats(team: str):
+def team_stats(
+    team: str
+):
 
     data = fetch_json(
-        f"{ESPN_SITE}/teams/{team}/statistics",
+
+        f"{ESPN_SITE}/teams/"
+        f"{team}/statistics",
+
         allow_failure=True
     )
-
-
-    if not data:
-
-        return {
-
-            "team": team.upper(),
-
-            "available": False,
-
-            "message": (
-                "ESPN team statistics endpoint "
-                "was unavailable from this server."
-            )
-        }
-
-
-    return {
-
-        "team": team.upper(),
-
-        "available": True,
-
-        "data": data
-    }
-
-
-# ---------------------------------------------------------
-# TEAM ROSTER
-# ---------------------------------------------------------
-
-@app.get("/team/{team}/roster")
-def team_roster(team: str):
-
-    data = fetch_json(
-        f"{ESPN_SITE}/teams/{team}/roster",
-        allow_failure=True
-    )
-
-
-    if not data:
-
-        return {
-
-            "team":
-                team.upper(),
-
-            "available":
-                False,
-
-            "players":
-                []
-        }
-
-
-    players = []
-
-
-    for group in data.get(
-        "athletes",
-        []
-    ):
-
-        position_group = group.get(
-            "position"
-        )
-
-
-        for athlete in group.get(
-            "items",
-            []
-        ):
-
-            players.append({
-
-                "player_id":
-                    athlete.get("id"),
-
-                "name":
-                    athlete.get("fullName"),
-
-                "display_name":
-                    athlete.get("displayName"),
-
-                "position":
-                    athlete.get(
-                        "position",
-                        {}
-                    ).get(
-                        "abbreviation"
-                    ),
-
-                "jersey":
-                    athlete.get("jersey"),
-
-                "age":
-                    athlete.get("age"),
-
-                "height":
-                    athlete.get(
-                        "displayHeight"
-                    ),
-
-                "weight":
-                    athlete.get(
-                        "displayWeight"
-                    ),
-
-                "status":
-                    athlete.get("status"),
-
-                "position_group":
-                    position_group
-            })
 
 
     return {
@@ -737,10 +587,41 @@ def team_roster(team: str):
             team.upper(),
 
         "available":
-            True,
+            bool(data),
 
-        "players":
-            players
+        "data":
+            data
+    }
+
+
+# ---------------------------------------------------------
+# TEAM ROSTER
+# ---------------------------------------------------------
+
+@app.get("/team/{team}/roster")
+def team_roster(
+    team: str
+):
+
+    data = fetch_json(
+
+        f"{ESPN_SITE}/teams/"
+        f"{team}/roster",
+
+        allow_failure=True
+    )
+
+
+    return {
+
+        "team":
+            team.upper(),
+
+        "available":
+            bool(data),
+
+        "data":
+            data
     }
 
 
@@ -749,10 +630,15 @@ def team_roster(team: str):
 # ---------------------------------------------------------
 
 @app.get("/player/{player_id}")
-def player(player_id: str):
+def player(
+    player_id: str
+):
 
     data = fetch_json(
-        f"{ESPN_WEB}/athletes/{player_id}",
+
+        f"{ESPN_WEB}/athletes/"
+        f"{player_id}",
+
         allow_failure=True
     )
 
@@ -774,7 +660,9 @@ def player(player_id: str):
 # PLAYER STATS
 # ---------------------------------------------------------
 
-@app.get("/player/{player_id}/stats")
+@app.get(
+    "/player/{player_id}/stats"
+)
 def player_stats(
     player_id: str,
     season: int = None
@@ -790,7 +678,8 @@ def player_stats(
 
     data = fetch_json(
 
-        f"{ESPN_WEB}/athletes/{player_id}/stats",
+        f"{ESPN_WEB}/athletes/"
+        f"{player_id}/stats",
 
         params if params else None,
 
@@ -818,7 +707,9 @@ def player_stats(
 # PLAYER GAME LOG
 # ---------------------------------------------------------
 
-@app.get("/player/{player_id}/gamelog")
+@app.get(
+    "/player/{player_id}/gamelog"
+)
 def player_gamelog(
     player_id: str,
     season: int = None
@@ -832,7 +723,8 @@ def player_gamelog(
 
     data = fetch_json(
 
-        f"{ESPN_WEB}/athletes/{player_id}/gamelog",
+        f"{ESPN_WEB}/athletes/"
+        f"{player_id}/gamelog",
 
         params if params else None,
 
@@ -860,26 +752,27 @@ def player_gamelog(
 # WEEKLY RESEARCH PACKAGE
 # ---------------------------------------------------------
 
-@app.get("/research/{season}/{week}")
+@app.get(
+    "/research/{season}/{week}"
+)
 def weekly_research(
     season: int,
     week: int
 ):
 
-    schedule_package = get_week_schedule(
+    schedule_result = get_week_schedule(
         season,
         week
     )
 
-    games = normalize_schedule(
-        schedule_package
-    )
-
+    schedule_games = schedule_result[
+        "games"
+    ]
 
     research_games = []
 
 
-    for game in games:
+    for game in schedule_games:
 
         game_id = game.get(
             "game_id"
@@ -895,20 +788,29 @@ def weekly_research(
             {}
         )
 
-        home_abbr = home.get(
-            "abbreviation"
-        )
 
-        away_abbr = away.get(
-            "abbreviation"
-        )
+        # -------------------------------------
+        # CORE EVENT
+        # -------------------------------------
+
+        core_event = {}
+
+        if game_id:
+
+            core_event = fetch_json(
+
+                f"{ESPN_CORE}/events/"
+                f"{game_id}",
+
+                allow_failure=True
+            )
 
 
-        # -------------------------------------------------
-        # GAME DETAILS
-        # -------------------------------------------------
+        # -------------------------------------
+        # SITE GAME SUMMARY
+        # -------------------------------------
 
-        game_data = {}
+        site_summary = {}
 
         if game_id:
 
@@ -917,37 +819,47 @@ def weekly_research(
                 f"{ESPN_SITE}/summary",
 
                 {
-                    "event": game_id
+                    "event":
+                        game_id
                 },
 
                 allow_failure=True
             )
 
 
-            if site_summary:
+        # -------------------------------------
+        # CDN GAME PACKAGE
+        # -------------------------------------
 
-                game_data = site_summary
+        cdn_game = {}
 
-            else:
+        if game_id:
 
-                game_data = fetch_json(
+            cdn_game = fetch_json(
 
-                    f"{ESPN_CDN}/boxscore",
+                f"{ESPN_CDN}/game",
 
-                    {
-                        "xhr": 1,
-                        "gameId": game_id
-                    },
+                {
+                    "xhr":
+                        1,
 
-                    allow_failure=True
-                )
+                    "gameId":
+                        game_id
+                },
+
+                allow_failure=True
+            )
 
 
-        # -------------------------------------------------
+        # -------------------------------------
         # HOME TEAM STATS
-        # -------------------------------------------------
+        # -------------------------------------
 
         home_stats = {}
+
+        home_abbr = home.get(
+            "abbreviation"
+        )
 
         if home_abbr:
 
@@ -960,11 +872,15 @@ def weekly_research(
             )
 
 
-        # -------------------------------------------------
+        # -------------------------------------
         # AWAY TEAM STATS
-        # -------------------------------------------------
+        # -------------------------------------
 
         away_stats = {}
+
+        away_abbr = away.get(
+            "abbreviation"
+        )
 
         if away_abbr:
 
@@ -976,44 +892,6 @@ def weekly_research(
                 allow_failure=True
             )
 
-
-        # -------------------------------------------------
-        # HOME ROSTER
-        # -------------------------------------------------
-
-        home_roster = {}
-
-        if home_abbr:
-
-            home_roster = fetch_json(
-
-                f"{ESPN_SITE}/teams/"
-                f"{home_abbr}/roster",
-
-                allow_failure=True
-            )
-
-
-        # -------------------------------------------------
-        # AWAY ROSTER
-        # -------------------------------------------------
-
-        away_roster = {}
-
-        if away_abbr:
-
-            away_roster = fetch_json(
-
-                f"{ESPN_SITE}/teams/"
-                f"{away_abbr}/roster",
-
-                allow_failure=True
-            )
-
-
-        # -------------------------------------------------
-        # CREATE GAME RESEARCH OBJECT
-        # -------------------------------------------------
 
         research_games.append({
 
@@ -1031,54 +909,78 @@ def weekly_research(
 
             "home": {
 
+                "team_id":
+                    home.get(
+                        "team_id"
+                    ),
+
                 "name":
-                    home.get("name"),
+                    home.get(
+                        "name"
+                    ),
 
                 "abbreviation":
                     home_abbr,
 
-                "team_id":
-                    home.get("team_id"),
-
-                "record":
-                    home.get("records"),
-
                 "score":
-                    home.get("score"),
+                    home.get(
+                        "score"
+                    ),
 
                 "season_stats":
-                    home_stats,
-
-                "roster":
-                    home_roster
+                    home_stats
             },
 
             "away": {
 
+                "team_id":
+                    away.get(
+                        "team_id"
+                    ),
+
                 "name":
-                    away.get("name"),
+                    away.get(
+                        "name"
+                    ),
 
                 "abbreviation":
                     away_abbr,
 
-                "team_id":
-                    away.get("team_id"),
-
-                "record":
-                    away.get("records"),
-
                 "score":
-                    away.get("score"),
+                    away.get(
+                        "score"
+                    ),
 
                 "season_stats":
-                    away_stats,
-
-                "roster":
-                    away_roster
+                    away_stats
             },
 
-            "game_data":
-                game_data
+            "data_sources": {
+
+                "core_event_available":
+                    bool(
+                        core_event
+                    ),
+
+                "site_summary_available":
+                    bool(
+                        site_summary
+                    ),
+
+                "cdn_game_available":
+                    bool(
+                        cdn_game
+                    )
+            },
+
+            "core_event":
+                core_event,
+
+            "game_summary":
+                site_summary,
+
+            "cdn_game":
+                cdn_game
         })
 
 
@@ -1091,10 +993,14 @@ def weekly_research(
             week,
 
         "schedule_source":
-            schedule_package["source"],
+            schedule_result[
+                "source"
+            ],
 
         "game_count":
-            len(research_games),
+            len(
+                research_games
+            ),
 
         "games":
             research_games
