@@ -259,4 +259,5 @@ def weekly_research(season: int, week: int):
         "week": week,
         "game_count": len(research_games),
         "games": research_games
-    }
+    }@app.get("/research/{season}/{week}")
+    def weekly_research(season: int, week: int):
